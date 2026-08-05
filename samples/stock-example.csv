@@ -1,0 +1,4 @@
+sku,movement_type,quantity,occurred_at
+SKU-001,IN,10,2026-08-05T10:00:00Z
+SKU-001,OUT,3,2026-08-05T11:00:00Z
+SKU-002,IN,5,2026-08-05T12:00:00Z
