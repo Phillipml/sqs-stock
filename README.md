@@ -10,11 +10,11 @@ Infra: Docker → ECR → ECS
 ## Tecnologias utilizadas
 
 - **Python 3.11+** / **FastAPI** / **Uvicorn** — `upload-service`
-- **boto3** — S3 (`put_object`) e SQS (`send_message`)
+- **Python** / **boto3** / **pymongo** — `stock-worker`
 - **pydantic / pydantic-settings** — schemas e config tipados
-- **MongoDB 8** — estoque local via Docker Compose (consumo na etapa do worker)
+- **MongoDB 8** — estoque local via Docker Compose
 - **Amazon S3** — armazenamento do CSV
-- **Amazon SQS** — fila + DLQ para eventos
+- **Amazon SQS** — fila + DLQ para eventos (consumida pelo worker local)
 - **Docker / Docker Compose** — Mongo local; depois containerização dos serviços
 - **AWS ECR + ECS Fargate** — deploy (planejado)
 
@@ -22,11 +22,11 @@ Infra: Docker → ECR → ECS
 
 ### Banco de dados
 
-MongoDB para o saldo por `sku` e para idempotência (`processed_events` por `event_id`). Modelo documental encaixa em upsert de quantidade e evita schema rígido no lab. Índice unique em `sku` e em `event_id` evita duplicar estoque em reentrega da fila. O worker que grava no Mongo ainda não existe (branch `04`).
+MongoDB para o saldo por `sku` (`products`) e idempotência por `event_id` (`processed_events`). Upsert com `$inc` aplica `IN`/`OUT`. Índices unique em `sku` e `event_id` evitam duplicar estoque em reentrega da fila.
 
 ### Integração com eventos (S3 + SQS)
 
-O CSV fica no S3; a SQS só carrega metadados (`StockStatementReceived` v1 em `docs/sqs-event.md`). Desacopla upload do processamento, permite retry e DLQ após 3 falhas. Não há integração com LLM neste projeto.
+O CSV fica no S3; a SQS só carrega metadados (`StockStatementReceived` v1 em `docs/sqs-event.md`). O `upload-service` publica; o `stock-worker` faz long poll, baixa o CSV, atualiza o Mongo e só então deleta a mensagem. Falha → não deleta → retry → DLQ após 3 receives. Não há integração com LLM neste projeto.
 
 ### Multi-tenancy
 
@@ -36,16 +36,17 @@ Não aplicável neste lab: um bucket, uma fila e um banco. Isolamento por tenant
 
 | Desafio | Abordagem |
 |---|---|
-| Contrato entre serviços | Evento versionado em `docs/sqs-event.md` antes do worker |
-| Mensagens que falham | DLQ com `maxReceiveCount=3`; worker só deleta após sucesso |
-| Secrets no git | `.env` local; credenciais AWS em `~/.aws` (Access Key), nunca no repo |
-| PowerShell `curl` | Usar `curl.exe` — o alias aponta para `Invoke-WebRequest` |
-| Credencial `login` / CRT | Preferir Access Key clássica no IAM user de lab |
-| Mensagem sem consumer | Fica na fila principal; **não** vai à DLQ sozinha |
+| Contrato entre serviços | Evento versionado em `docs/sqs-event.md` |
+| Mensagens que falham | DLQ `maxReceiveCount=3`; worker só deleta após sucesso |
+| Reentrega / duplicata | `processed_events` por `event_id` — skip sem reaplicar saldo |
+| Secrets no git | `.env` local; credenciais AWS em `~/.aws` |
+| PowerShell `curl` | Usar `curl.exe` |
+| Ver msg na fila com worker ligado | Msg some rápido; pare o worker para inspecionar no Console |
+| Compass “desatualizado” | Refresh manual — GUI não faz live reload |
 
-## Estado atual (branch `03-upload-service`)
+## Estado atual (branch `04-stock-worker`)
 
-Infra AWS + `upload-service` operacional: CSV → S3 + mensagem SQS. Sem `stock-worker` ainda.
+Fluxo local completo: upload → S3/SQS (AWS) → worker → Mongo (Docker).
 
 ```
 sqs-stock/
@@ -56,12 +57,10 @@ sqs-stock/
 ├── samples/stock-example.csv
 ├── upload-service/
 │   ├── requirements.txt
-│   └── app/
-│       ├── config.py
-│       ├── schemas.py
-│       ├── s3.py
-│       ├── sqs.py
-│       └── main.py
+│   └── app/ (config, schemas, s3, sqs, main)
+├── stock-worker/
+│   ├── requirements.txt
+│   └── app/ (config, schemas, s3, csv_parser, repository, worker)
 └── README.md
 ```
 
@@ -74,7 +73,7 @@ sqs-stock/
 | SQS | `sqs-stock-statements` — visibility 60s, long poll 20s |
 | DLQ | `sqs-stock-statements-dlq` — max receives = 3 |
 
-Preencha `S3_BUCKET` e `SQS_QUEUE_URL` no `.env` (nunca no git).
+Preencha `S3_BUCKET`, `SQS_QUEUE_URL`, `MONGO_URI`, `MONGO_DB` no `.env` (nunca no git).
 
 ## Funcionalidades implementadas
 
@@ -88,12 +87,13 @@ Preencha `S3_BUCKET` e `SQS_QUEUE_URL` no `.env` (nunca no git).
 - [x] Variáveis locais em `.env` / `.env.example`
 - [x] `upload-service` — `GET /health`, `POST /uploads` → S3 + SQS (202)
 - [x] Validação de arquivo (`.csv`, tamanho, nome)
+- [x] `stock-worker` — consome SQS, baixa S3, parse CSV, atualiza Mongo
+- [x] Idempotência por `event_id` (`processed_events`)
+- [x] Delete na fila só após sucesso
 
 ### Pendentes / diferenciais
 
-- [ ] `stock-worker` — consome fila, parse CSV, atualiza Mongo
-- [ ] Idempotência por `event_id`
-- [ ] E2E local documentado
+- [ ] E2E documentado em `docs/e2e.md` (branch `05`)
 - [ ] Dockerize dos serviços
 - [ ] Deploy ECR + ECS
 - [ ] Smoke pós-deploy
@@ -108,32 +108,51 @@ docker compose up -d
 aws sts get-caller-identity
 ```
 
-### Rodar o upload-service
+### Terminal A — upload-service
 
 ```powershell
 cd upload-service
-python -m venv .venv
 .\.venv\Scripts\activate
-pip install -r requirements.txt
 uvicorn app.main:app --reload --port 8000
 ```
 
-### Testar upload (PowerShell)
+### Terminal B — stock-worker
 
 ```powershell
-curl.exe http://localhost:8000/health
+cd stock-worker
+.\.venv\Scripts\activate
+python -m app.worker
+```
 
-cd ..   # raiz do repo
+Log esperado: `worker started queue=https://sqs.us-east-1.amazonaws.com/...`
+
+### Terminal C — enviar CSV
+
+```powershell
+cd d:\01-code\00-AWS\SQS\sqs-stock
 curl.exe -X POST "http://localhost:8000/uploads" -F "file=@samples/stock-example.csv"
 ```
 
-Esperado: **202** com `file_id`, `s3_key`, `event_id`, `status: accepted`.
+Esperado: **202** + logs no worker (`processing` → `done`).
 
-Conferir:
+### Conferir Mongo
 
-- S3 → `stock-statements/{file_id}.csv`
-- SQS Console → fila → **Send and receive messages** → **Poll for messages**
-- Swagger → `http://localhost:8000/docs`
+```powershell
+docker compose exec mongo mongosh --eval "db.getSiblingDB('stock').products.find().toArray()"
+```
+
+Sample (`stock-example.csv`): por upload → `SKU-001 +7`, `SKU-002 +5`.
+
+No Compass: dar **Refresh** na collection — a GUI não atualiza sozinha.
+
+### Ver mensagem na SQS (opcional)
+
+1. Pare o worker  
+2. Faça o upload  
+3. Console → SQS → `sqs-stock-statements` → **Poll for messages**  
+4. Suba o worker de novo → msg some e Mongo atualiza  
+
+Sem consumer a mensagem **fica** na fila (não vai à DLQ sozinha).
 
 ## Branches do dia
 
@@ -141,9 +160,9 @@ Conferir:
 |---|---|
 | `01-scaffold` | Compose, contrato, sample |
 | `02-infra-aws` | S3 + SQS + DLQ |
-| `03-upload-service` | API de upload ← **atual** |
-| `04-stock-worker` | Consumer + Mongo |
-| `05-e2e-local` | Fluxo ponta a ponta |
+| `03-upload-service` | API de upload |
+| `04-stock-worker` | Consumer + Mongo ← **atual** |
+| `05-e2e-local` | Fluxo ponta a ponta documentado |
 | `06-dockerize` | Dockerfiles + compose |
 | `07-ecr-ecs` | Deploy AWS |
 | `08-docs` | Docs e smoke final |

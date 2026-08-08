@@ -12,3 +12,5 @@ Nomes reais de bucket/URL ficam no `.env` local (não versionado).
 - Mensagem **sem consumer** permanece na fila principal (não cai na DLQ sozinha).
 - DLQ só após N receives sem `DeleteMessage` (N = 3).
 - Poll repetido no Console conta como receive — pode empurrar para a DLQ.
+- O `stock-worker` roda local e consome esta fila AWS via boto3 (`ReceiveMessage` + `DeleteMessage`).
+- Com o worker ligado, a mensagem some rápido do Console — pare o worker para inspecionar.
